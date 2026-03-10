@@ -437,7 +437,8 @@ class Qwen3VLTextAttention(Qwen3Attention):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_values is not None:
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+            cache_kwargs = {"cache_position": kwargs.get("cache_position"), "layer_index": self.layer_idx}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
             self.config._attn_implementation, eager_attention_forward
@@ -728,6 +729,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
     def __init__(self, config: Qwen3VLTextConfig):
         super().__init__(config)
         del self.has_sliding_layers
+        self.all_FLOPs = 0
+        self.total_cuda_time = 0
+        self.num_forward = 0
+        self.pruning_loc = [2, 6, 9, 11]
 
     def _deepstack_process(
         self, hidden_states: torch.Tensor, visual_pos_masks: torch.Tensor, visual_embeds: torch.Tensor
@@ -750,6 +755,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
         # args for deepstack
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
@@ -763,6 +769,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
             The feature is extracted from the different visual encoder layers, and fed to the decoder
             hidden states. It's from the paper DeepStack(https://arxiv.org/abs/2406.04334).
         """
+
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -773,11 +780,28 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
 
+        proportion_attn_var = getattr(self.config, "proportion_attn_var", None)
+        reusable_patches = getattr(self.config, "reusable_patches", None)
+        pruning_loc = getattr(self, "pruning_loc", tuple())
+
+        # VLA-CACHE: For kv cache update with uncontinuous cache positions
+        if cache_position is None:
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if proportion_attn_var is None or inputs_embeds.shape[1] == 1 else 0
+            )
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
         # the hard coded `4` is for text, temporal, height and width.
         if position_ids is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+
+            # VLA-CACHE: Use past_seen_tokens and position_ids calculated using cache considered rule
+            # past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            # position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            # position_ids = position_ids.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+            position_ids = cache_position.view(1, 1, -1).expand(4, inputs_embeds.shape[0], -1)
+
         elif position_ids.ndim == 2:
             position_ids = position_ids[None, ...].expand(4, position_ids.shape[0], -1)
 
@@ -799,15 +823,79 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
 
         # create position embeddings to be shared across the decoder layers
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        last_reusable_patches = None
+        
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        torch.cuda.synchronize()
+        start_event.record()
 
         # decoder layers
         for layer_idx, decoder_layer in enumerate(self.layers):
+            if (
+                proportion_attn_var is not None
+                and reusable_patches is not None
+                and hidden_states.shape[1] != 1
+                and layer_idx in pruning_loc
+            ):
+                if not torch.is_tensor(reusable_patches):
+                    reusable_patches = torch.tensor(reusable_patches, device=hidden_states.device, dtype=torch.long)
+                else:
+                    reusable_patches = reusable_patches.to(device=hidden_states.device, dtype=torch.long)
+
+                top_k = max(1, int(proportion_attn_var[layer_idx] * len(reusable_patches)))
+                selected_reusable_patches = reusable_patches[:top_k]
+
+                if last_reusable_patches is None:
+                    last_reusable_patches = selected_reusable_patches
+
+                if last_reusable_patches.size(0) <= selected_reusable_patches.size(0):
+                    mask = ~torch.isin(cache_position, selected_reusable_patches)
+                    if not mask.all():
+                        if attention_mask is not None:
+                            attention_mask = attention_mask[..., mask, :]
+                        hidden_states = hidden_states[:, mask, :]
+                        cache_position = cache_position[mask]
+
+                        if text_position_ids is not None:
+                            text_position_ids = text_position_ids[:, mask]
+
+                        if position_ids is not None:
+                            if position_ids.ndim == 3:
+                                position_ids = position_ids[:, :, mask]
+                            elif position_ids.ndim == 2:
+                                position_ids = position_ids[:, mask]
+
+                        if visual_pos_masks is not None:
+                            visible_mask = mask.unsqueeze(0).expand_as(visual_pos_masks)
+                            visual_keep_mask = visible_mask[visual_pos_masks]
+                            visual_pos_masks = visual_pos_masks[:, mask]
+
+                            if deepstack_visual_embeds is not None:
+                                deepstack_visual_embeds = [
+                                    emb[visual_keep_mask.to(emb.device)] for emb in deepstack_visual_embeds
+                                ]
+
+                        cos, sin = position_embeddings
+                        position_embeddings = (cos[:, mask, :], sin[:, mask, :])
+
+                    last_reusable_patches = selected_reusable_patches
+            
+            if hidden_states.shape[1] !=1:     
+                n = hidden_states.shape[1]                                  # token num
+                d = hidden_states.shape[2]                                  # hidden state size 
+                m = self.layers[layer_idx].mlp.up_proj.out_features         # intermediate size of the FFN
+                FLOPs_current = 4 * n * (d**2) + 2 *(n**2) * d + 3*n*d*m 
+                self.all_FLOPs += FLOPs_current
+
             layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=text_position_ids,
                 past_key_values=past_key_values,
                 position_embeddings=position_embeddings,
+                cache_position=cache_position,
                 **kwargs,
             )
             hidden_states = layer_outputs
@@ -820,6 +908,18 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
                     deepstack_visual_embeds[layer_idx],
                 )
 
+        if hidden_states.shape[1] !=1:
+            end_event.record()
+            torch.cuda.synchronize() 
+            
+            cuda_time_current = start_event.elapsed_time(end_event)
+            self.total_cuda_time += cuda_time_current
+            self.num_forward += 1
+
+            FLOPs_avg_sample = (self.all_FLOPs / self.num_forward) * 1e-12
+            cuda_time_avg = self.total_cuda_time / self.num_forward
+            print(f"Current CUDA latency: {cuda_time_current:.6f} ms | Average CUDA latency: {cuda_time_avg:.6f} ms, Average TFLOPs: {FLOPs_avg_sample:.6f}")
+    
         hidden_states = self.norm(hidden_states)
 
         return BaseModelOutputWithPast(

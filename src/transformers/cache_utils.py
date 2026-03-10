@@ -100,7 +100,7 @@ class DynamicLayer(CacheLayerMixin):
         self.is_initialized = True
 
     def update(
-        self, key_states: torch.Tensor, value_states: torch.Tensor, *args, **kwargs
+        self, key_states: torch.Tensor, value_states: torch.Tensor, cache_kwargs=None, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Update the key and value caches in-place, and return the necessary keys and value states.
@@ -115,9 +115,29 @@ class DynamicLayer(CacheLayerMixin):
         # Lazy initialization
         if not self.is_initialized:
             self.lazy_initialization(key_states, value_states)
+            
+        # VLA-CACHE: cache_positions is passed as a kwarg
+        cache_kwargs = kwargs.get("cache_kwargs", cache_kwargs)
+        cache_position = cache_kwargs.get("cache_position") if cache_kwargs is not None else None
+        if cache_position is None:
+            cache_position = torch.arange(key_states.size(-2), device=key_states.device)
 
-        self.keys = torch.cat([self.keys, key_states], dim=-2)
-        self.values = torch.cat([self.values, value_states], dim=-2)
+        # VLA-CACHE: Use cache_position to update only the relevant positions in the cache,
+        # instead of always appending at the end.
+        # self.keys = torch.cat([self.keys, key_states], dim=-2)
+        # self.values = torch.cat([self.values, value_states], dim=-2)
+        if len(self.keys) == 0:
+            self.keys = key_states
+            self.values = value_states
+            return self.keys, self.values
+        elif cache_position.size(-1) != 1:
+            self.keys.index_copy_(2, cache_position, key_states)
+            self.values.index_copy_(2, cache_position, value_states)
+        elif cache_position.size(-1) == 1:
+            self.keys = torch.cat([self.keys, key_states], dim=-2)
+            self.values = torch.cat([self.values, value_states], dim=-2)
+        else:  
+            print(f"cache_position: {cache_position.size(-1)}, key_states: {key_states.size()}, values_states: {value_states.size()}")
         return self.keys, self.values
 
     def get_mask_sizes(self, query_length: int) -> tuple[int, int]:

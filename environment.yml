@@ -1,0 +1,4 @@
+name: qwen3-vl
+channels:
+  - defaults
+prefix: /home/um3maru/yes/envs/qwen3-vl
