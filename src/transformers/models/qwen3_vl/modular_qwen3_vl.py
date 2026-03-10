@@ -836,6 +836,7 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
         start_event.record()
         
         should_profile = 10 < self.call_count < 20
+        self.call_count += 1
         prof_ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) if should_profile else nullcontext()
 
         with prof_ctx as prof:
