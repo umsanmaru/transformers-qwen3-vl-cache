@@ -837,7 +837,10 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
         
         should_profile = 10 < self.call_count < 20
         self.call_count += 1
-        prof_ctx = profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) if should_profile else nullcontext()
+        prof_ctx = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            acc_events=True,
+        ) if should_profile else nullcontext()
 
         with prof_ctx as prof:
             # decoder layers
@@ -916,7 +919,8 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
                         visual_pos_masks,
                         deepstack_visual_embeds[layer_idx],
                     )
-
+        if should_profile:        
+            print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=30))
         if hidden_states.shape[1] !=1:
             end_event.record()
             torch.cuda.synchronize() 
