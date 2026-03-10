@@ -835,11 +835,17 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel, Qwen3Model):
         torch.cuda.synchronize()
         start_event.record()
         
-        should_profile = 10 < self.call_count < 20
+        trace_dir = "./traces"
+        
+        should_profile = self.call_count == 15
         self.call_count += 1
         prof_ctx = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
             acc_events=True,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(trace_dir),
         ) if should_profile else nullcontext()
 
         with prof_ctx as prof:
