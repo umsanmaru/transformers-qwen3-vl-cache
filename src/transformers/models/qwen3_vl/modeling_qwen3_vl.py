@@ -20,12 +20,14 @@
 
 import itertools
 from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.profiler import ProfilerActivity, profile, record_function
 
 from ... import initialization as init
 from ...activations import ACT2FN
@@ -845,6 +847,9 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         self.num_forward = 0
         self.pruning_loc = [2, 6, 9, 11]
 
+        # profiler related variables
+        self.call_count = 0
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -934,86 +939,90 @@ class Qwen3VLTextModel(Qwen3VLPreTrainedModel):
         torch.cuda.synchronize()
         start_event.record()
 
-        # decoder layers
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            if (
-                proportion_attn_var is not None
-                and reusable_patches is not None
-                and hidden_states.shape[1] != 1
-                and layer_idx in pruning_loc
-            ):
-                if not torch.is_tensor(reusable_patches):
-                    reusable_patches = torch.tensor(reusable_patches, device=hidden_states.device, dtype=torch.long)
-                else:
-                    reusable_patches = reusable_patches.to(device=hidden_states.device, dtype=torch.long)
+        should_profile = 10 < self.call_count < 20
+        prof_ctx = (
+            profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) if should_profile else nullcontext()
+        )
 
-                top_k = max(1, int(proportion_attn_var[layer_idx] * len(reusable_patches)))
-                selected_reusable_patches = reusable_patches[:top_k]
+        with prof_ctx as prof:
+            # decoder layers
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                if (
+                    proportion_attn_var is not None
+                    and reusable_patches is not None
+                    and hidden_states.shape[1] != 1
+                    and layer_idx in pruning_loc
+                ):
+                    if not torch.is_tensor(reusable_patches):
+                        reusable_patches = torch.tensor(
+                            reusable_patches, device=hidden_states.device, dtype=torch.long
+                        )
+                    else:
+                        reusable_patches = reusable_patches.to(device=hidden_states.device, dtype=torch.long)
 
-                if last_reusable_patches is None:
-                    last_reusable_patches = selected_reusable_patches
+                    top_k = max(1, int(proportion_attn_var[layer_idx] * len(reusable_patches)))
+                    selected_reusable_patches = reusable_patches[:top_k]
 
-                if last_reusable_patches.size(0) <= selected_reusable_patches.size(0):
-                    mask = ~torch.isin(cache_position, selected_reusable_patches)
-                    if not mask.all():
-                        if attention_mask is not None:
-                            attention_mask = attention_mask[..., mask, :]
-                        hidden_states = hidden_states[:, mask, :]
-                        cache_position = cache_position[mask]
+                    if last_reusable_patches is None:
+                        last_reusable_patches = selected_reusable_patches
 
-                        if text_position_ids is not None:
-                            text_position_ids = text_position_ids[:, mask]
+                    if last_reusable_patches.size(0) <= selected_reusable_patches.size(0):
+                        mask = ~torch.isin(cache_position, selected_reusable_patches)
+                        if not mask.all():
+                            if attention_mask is not None:
+                                attention_mask = attention_mask[..., mask, :]
+                            hidden_states = hidden_states[:, mask, :]
+                            cache_position = cache_position[mask]
 
-                        if position_ids is not None:
-                            if position_ids.ndim == 3:
-                                position_ids = position_ids[:, :, mask]
-                            elif position_ids.ndim == 2:
-                                position_ids = position_ids[:, mask]
+                            if text_position_ids is not None:
+                                text_position_ids = text_position_ids[:, mask]
 
-                        if visual_pos_masks is not None:
-                            visible_mask = mask.unsqueeze(0).expand_as(visual_pos_masks)
-                            visual_keep_mask = visible_mask[visual_pos_masks]
-                            visual_pos_masks = visual_pos_masks[:, mask]
+                            if position_ids is not None:
+                                if position_ids.ndim == 3:
+                                    position_ids = position_ids[:, :, mask]
+                                elif position_ids.ndim == 2:
+                                    position_ids = position_ids[:, mask]
 
-                            if deepstack_visual_embeds is not None:
-                                deepstack_visual_embeds = [
-                                    emb[visual_keep_mask.to(emb.device)] for emb in deepstack_visual_embeds
-                                ]
+                            if visual_pos_masks is not None:
+                                visible_mask = mask.unsqueeze(0).expand_as(visual_pos_masks)
+                                visual_keep_mask = visible_mask[visual_pos_masks]
+                                visual_pos_masks = visual_pos_masks[:, mask]
 
-                        cos, sin = position_embeddings
-                        position_embeddings = (cos[:, mask, :], sin[:, mask, :])
+                                if deepstack_visual_embeds is not None:
+                                    deepstack_visual_embeds = [
+                                        emb[visual_keep_mask.to(emb.device)] for emb in deepstack_visual_embeds
+                                    ]
 
-                    last_reusable_patches = selected_reusable_patches
+                            cos, sin = position_embeddings
+                            position_embeddings = (cos[:, mask, :], sin[:, mask, :])
 
-            if hidden_states.shape[1] != 1:
-                n = hidden_states.shape[1]  # token num
-                d = hidden_states.shape[2]  # hidden state size
-                m = self.layers[layer_idx].mlp.up_proj.out_features  # intermediate size of the FFN
-                FLOPs_current = 4 * n * (d**2) + 2 * (n**2) * d + 3 * n * d * m
-                self.all_FLOPs += FLOPs_current
-                if layer_idx == 2:
-                    print(
-                        f"FLOPs at layer {layer_idx}: {FLOPs_current * 1e-12:.6f} TFLOPs, token num: {n}, hidden size: {d}, intermediate size: {m}"
+                        last_reusable_patches = selected_reusable_patches
+
+                if hidden_states.shape[1] != 1:
+                    n = hidden_states.shape[1]  # token num
+                    d = hidden_states.shape[2]  # hidden state size
+                    m = self.layers[layer_idx].mlp.up_proj.out_features  # intermediate size of the FFN
+                    FLOPs_current = 4 * n * (d**2) + 2 * (n**2) * d + 3 * n * d * m
+                    self.all_FLOPs += FLOPs_current
+                with record_function("decoder_layer_forward"):
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=text_position_ids,
+                        past_key_values=past_key_values,
+                        position_embeddings=position_embeddings,
+                        cache_position=cache_position,
+                        **kwargs,
                     )
+                hidden_states = layer_outputs
 
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=text_position_ids,
-                past_key_values=past_key_values,
-                position_embeddings=position_embeddings,
-                cache_position=cache_position,
-                **kwargs,
-            )
-            hidden_states = layer_outputs
-
-            # add visual features to the hidden states of first several layers
-            if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
-                hidden_states = self._deepstack_process(
-                    hidden_states,
-                    visual_pos_masks,
-                    deepstack_visual_embeds[layer_idx],
-                )
+                # add visual features to the hidden states of first several layers
+                if deepstack_visual_embeds is not None and layer_idx in range(len(deepstack_visual_embeds)):
+                    hidden_states = self._deepstack_process(
+                        hidden_states,
+                        visual_pos_masks,
+                        deepstack_visual_embeds[layer_idx],
+                    )
 
         if hidden_states.shape[1] != 1:
             end_event.record()
